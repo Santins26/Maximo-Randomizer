@@ -4,6 +4,8 @@ Maximo: Ghosts to Glory — Randomizer
 Quick start
 -----------
 
+Recommended USA VERSION (Not tested in the others regions)
+
 1. Double-click MaximoRandomizer.exe to open the program.
 
 2. In the "Patch ISO" tab:
