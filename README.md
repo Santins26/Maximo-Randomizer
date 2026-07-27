@@ -4,7 +4,7 @@ Maximo: Ghosts to Glory — Randomizer
 Quick start
 -----------
 
-Recommended USA VERSION (Not tested in the others regions)
+Recommended USA or JAPAN VERSION (Not tested in the others regions)
 
 1. Double-click MaximoRandomizer.exe to open the program.
 
@@ -18,21 +18,18 @@ Recommended USA VERSION (Not tested in the others regions)
      for a random seed.
    - Click "Run randomizer".
 
-3. Boot the patched disc image in PCSX2.
-   IMPORTANT: do not load a save state taken before patching.
+3. Boot the patched disc image in PCSX2 or a Playstation 2 Console.
 
 What it does
 ------------
 
-- Shuffles enemies, items, chests, smashables, decorations across the
+- Randomize enemies, items, chests, smashables, decorations across the
   five worlds (Grave, Under, Swamp, Ice, Castle).
 - Shuffles the level order in each HUB and renames the column labels
   (and the loading-screen titles) to "???" so the level select is blind.
 - Randomizes chest contents, gold amounts, ability drops, collector
   drops, enemy tier values, and Monster_Generator parameters.
-- Protected by default: gate-key chests, Gold_Key entities, the
-  GraveDigger boss, and the boss room itself stay vanilla so the game
-  is always beatable.
+- Protected by default: gate-keys
 
 Supported disc formats
 ----------------------
