@@ -1,5 +1,5 @@
 """
-ISO 9660 reader and in-place patcher for the Maximo: Ghosts to Glory PS2 disc.
+ISO 9660 reader and patcher for the Maximo: Ghosts to Glory PS2 disc.
 
 Supported formats:
   - .iso (2048-byte sectors, plain user data) — typical PS2 DVD format
@@ -7,15 +7,49 @@ Supported formats:
                 — typical PS1/CD-format dumps
   - .bin (no .cue)        — sector format auto-detected from sync pattern
 
-In-place patching strategy:
-  Our randomizer pads every output file to its original size, so we seek to
-  the file's LBA inside the disc image and overwrite the user-data portion
-  of each sector. For 2352-byte BIN sectors, we write only the 2048-byte
-  user-data window; the surrounding sync/header bytes are left untouched.
+Patching strategy — files MAY grow:
+  Patched files are not required to keep their original size. This module
+  supports three outcomes, and the caller (see `iso_patcher.py`) picks
+  between them: write in place, write in place after growing into the
+  on-disc sector slack, or relocate the file to the end of the image.
 
-  We do NOT recalculate EDC/ECC after writing. PCSX2 ignores those fields by
-  default. If a strict tool flags the image, run it through any standard
-  CD-image fixer (cdrecord/cdmage/etc).
+  write_file(lba, data, original_length)
+    Overwrites the user-data portion of the sectors starting at `lba`.
+    `data` may be LARGER than `original_length` as long as it still fits
+    the on-disc slot, i.e. `original_length` rounded up to the next
+    2048-byte sector boundary. The method computes that sector slack, and
+    when a grown file grows into the slack it clears the full slot so no
+    stale bytes of the original data linger. If `data` exceeds the slot it
+    raises ValueError, directing the caller to relocation instead. For
+    2352-byte raw-CD sectors only the 2048-byte user-data window of each
+    sector is touched; the surrounding sync/header bytes are preserved.
+    Growing a file also requires the caller to update the ISO 9660
+    directory record length (see below) so the engine reads the new length.
+
+  append_file(data) -> new_lba
+    Appends `data` at the next sector boundary at the end of the image and
+    RETURNS THE NEW LBA. Used for files that outgrew their slot. Handles
+    both 2048-byte `.iso` images (plain contiguous append) and 2352-byte
+    raw `.bin` images: for raw CD it copies sector 16's framing as a
+    template, recomputes the per-sector MSF header bytes in BCD, and zeroes
+    the EDC/ECC fields. The caller must then repoint the file's directory
+    record at the returned LBA.
+
+  update_directory_entry_length(...) / update_directory_entry_lba_and_length(...)
+    Patch an ISO 9660 directory record in place. The record is matched by
+    its LBA (unique per disc, unlike the name), and both the little-endian
+    and big-endian copies are written: LBA at +2 / +6, data length at
+    +10 / +14. Use the length-only variant for a file that grew in place,
+    and the LBA+length variant for a relocated file.
+
+  file_parents()
+    Walks the whole directory tree and returns
+    {file_lba: (parent_dir_lba, parent_dir_length)} so any file's directory
+    record can be located for the updates above.
+
+  We do NOT recalculate EDC/ECC after writing or appending. PCSX2 ignores
+  those fields by default. If a strict tool flags the image, run it through
+  any standard CD-image fixer (cdrecord/cdmage/etc).
 
 ISO 9660 layout reference:
   Sector 16:   Primary Volume Descriptor (PVD)
@@ -524,6 +558,11 @@ class IsoFile:
 #   /PSXDATA/SWAMP/     S_*.PSX, SWAMP.BEF, SWAMP_B.BEF
 #   /PSXDATA/UNDER/     U_*.PSX, UNDER.BEF, UNDER_B.BEF, UNDER.PRS, UNDER.PRT
 #
+# The on-disc location of the SHARED assets (GLOBAL.PRS / GLOBAL.PRT) is NOT
+# documented and was never confirmed by inspection. find_maximo_files() below
+# therefore walks the entire directory tree instead of probing known paths, so
+# their location does not matter.
+#
 # Note: the BEF reference inside PSX files points to "CDS/Runtime/Maximo/
 # Materials/ResourceFiles/<...>.bef" — that's the dev path used at build
 # time. The retail engine maps it back to /PSXDATA/<WORLD>/.
@@ -534,42 +573,124 @@ SLUS_FILENAME = "SLUS_200.17"
 # Boot-executable filenames per region (root of the disc). The randomizer
 # detects whichever one is present. US: SLUS_200.17  JP: SLPM_621.27
 EXECUTABLE_FILENAMES = ("SLUS_200.17", "SLPM_621.27")
+# Every asset extension find_maximo_files() round-trips through the randomizer.
+#
+# `.BD` (sound banks) is here because a cross-world ported enemy whose samples
+# stay in its home world's bank is SILENT: `GetSpotFXID` linear-searches the
+# loaded bank's explicit EffectID field, so an id the bank does not carry is
+# simply not found, with no log line and no failure. The fix ships a MERGED
+# `GRAVE.BD`, and a file type that is never extracted can never be written back
+# -- the merged bank would have been discarded here, silently, and the feature
+# would have looked implemented while doing nothing.
+#
+# Adding it puts 13 more files (~20 MB) through the pipeline. That is safe
+# because extraction and write-back are byte-exact for a file nothing modified:
+# `write_patched_assets` writes a file at its original LBA when the size is
+# unchanged, so the 12 banks the randomizer does not touch are written back
+# identical to what was read. Tests cover that round trip explicitly.
+ASSET_FILE_EXTENSIONS = (".PSX", ".BEF", ".PRS", ".PRT", ".TEX", ".BD")
 
 
-def find_maximo_files(iso: IsoFile) -> dict[str, tuple[int, int]]:
+# Maximum directory nesting the walk will follow. ISO 9660 level 1 permits 8
+# levels; retail Maximo uses 2 (/PSXDATA/<WORLD>/). The cap only exists to stop
+# a malformed image from spinning forever, alongside the visited-LBA guard.
+MAX_WALK_DEPTH = 8
+
+
+def summarize_maximo_files(files: dict[str, tuple[int, int]]) -> str:
+    """One-line, self-diagnosing summary of what find_maximo_files() found.
+
+    Names the asset count and, explicitly, whether the two shared files the
+    cross-world pass depends on are present. When cross-world porting silently
+    produces nothing, this line is the first place to look.
+    """
+    missing = [n for n in ("GLOBAL.PRT", "GLOBAL.PRS") if n not in files]
+    shared = "GLOBAL.PRT+GLOBAL.PRS found" if not missing else (
+        f"MISSING {', '.join(missing)}")
+    return f"{len(files)} assets discovered on disc; {shared}"
+
+
+def find_maximo_files(iso: IsoFile, log=None) -> dict[str, tuple[int, int]]:
     """Locate all Maximo asset files inside the disc image.
 
-    Walks /PSXDATA/<WORLD>/ for each world and the root for the SLUS exe.
-    Returns a dict mapping uppercase filename → (lba, length).
+    Discovery is LOCATION-INDEPENDENT: the whole ISO 9660 directory tree is
+    walked from the root and every file whose name ends in one of
+    ASSET_FILE_EXTENSIONS is collected, wherever it sits. The previous version
+    probed a hardcoded path list, which meant a shared asset such as
+    GLOBAL.PRT — whose real on-disc location is not documented anywhere in
+    this repo — could be missed. Missing GLOBAL.PRT makes
+    cross_world.run_cross_world_placements abort every port, which the user
+    sees as "cross-world enemies enabled, no new enemies appeared".
+
+    Returns a dict mapping UPPERCASE filename -> (lba, length). The shape is
+    unchanged; many callers depend on it.
+
+    PRECEDENCE on duplicate filenames (highest wins):
+      1. a file inside /PSXDATA/<WORLD>/ for a known world folder
+      2. any other location, in walk order (parents before children, entries
+         within a directory in on-disc order)
+    So a world-folder copy always beats a stray duplicate elsewhere, and
+    within a tier the first occurrence wins — matching the previous
+    first-wins behaviour.
+
+    `log`: optional callable(str). When supplied, receives the
+    summarize_maximo_files() line so a run log records what was found.
+
+    Raises RuntimeError when the disc has no /PSXDATA/<world>/ folders (the
+    "wrong disc image" guard). World folders are detected during the same walk.
+
+    The boot executable (EXECUTABLE_FILENAMES: US SLUS_200.17 / JP
+    SLPM_621.27) is still taken from the disc root only.
 
     Collects PSX (level instances), BEF (entity scripts), PRS (resource pool),
     and PRT (resource pool table) files. The randomizer modifies PSX + SLUS;
     PRS/PRT/BEF are extracted as well so template lookups have everything.
     """
-    out: dict[str, tuple[int, int]] = {}
-
-    # Boot executable at root (region-aware: SLUS_200.17 / SLPM_621.27 / ...)
     exe_names = {n.upper() for n in EXECUTABLE_FILENAMES}
-    for name, lba, length, is_dir in iso.list_directory(iso._root_lba, iso._root_length):
-        if name.upper() in exe_names:
-            out[name.upper()] = (lba, length)
-            break
+    world_names = {w.upper() for w in WORLD_FOLDER_NAMES}
 
-    # Walk each world folder under /PSXDATA/
-    found_worlds = []
-    for world in WORLD_FOLDER_NAMES:
-        entries = iso.list_directory_path(PSXDATA_DIR, world)
-        if entries is None:
-            continue
-        found_worlds.append(world)
+    world_assets: dict[str, tuple[int, int]] = {}   # tier 1 (world folders)
+    other_assets: dict[str, tuple[int, int]] = {}   # tier 2 (anywhere else)
+    out: dict[str, tuple[int, int]] = {}            # boot exe goes straight in
+    found_worlds: list[str] = []
+    visited_dirs: set[int] = set()
+
+    def walk(dir_lba: int, dir_length: int, parents: tuple[str, ...]) -> None:
+        # Cycle guard: a malformed (or self-referential) directory record that
+        # points back at an already-visited directory stops the walk here.
+        if dir_lba in visited_dirs or len(parents) > MAX_WALK_DEPTH:
+            return
+        visited_dirs.add(dir_lba)
+        try:
+            entries = list(iso.list_directory(dir_lba, dir_length))
+        except Exception:
+            return
+        at_root = not parents
+        # `.` and `..` records (ISO 9660 single-byte names 0x00 / 0x01) are
+        # already dropped by list_directory, which compares the decoded name
+        # against "\x00" / "\x01".
         for name, lba, length, is_dir in entries:
-            if is_dir:
-                continue
             upper = name.upper()
-            if any(upper.endswith(ext) for ext in (".PSX", ".BEF", ".PRS", ".PRT", ".TEX")):
-                if upper in out:
-                    continue
-                out[upper] = (lba, length)
+            if is_dir:
+                if upper in world_names and parents[-1:] == (PSXDATA_DIR,):
+                    if upper not in found_worlds:
+                        found_worlds.append(upper)
+                walk(lba, length, parents + (upper,))
+                continue
+            if at_root and upper in exe_names:
+                out.setdefault(upper, (lba, length))
+                continue
+            if not any(upper.endswith(ext) for ext in ASSET_FILE_EXTENSIONS):
+                continue
+            in_world_folder = (
+                len(parents) >= 2
+                and parents[-2] == PSXDATA_DIR
+                and parents[-1] in world_names
+            )
+            bucket = world_assets if in_world_folder else other_assets
+            bucket.setdefault(upper, (lba, length))
+
+    walk(iso._root_lba, iso._root_length, ())
 
     if not found_worlds:
         raise RuntimeError(
@@ -577,5 +698,13 @@ def find_maximo_files(iso: IsoFile) -> dict[str, tuple[int, int]]:
             f"Looked for: {', '.join(WORLD_FOLDER_NAMES)}. "
             f"Is this the correct Maximo: Ghosts to Glory disc image?"
         )
+
+    # Tier 2 first, then tier 1 overwrites — world-folder copies win.
+    for upper, loc in other_assets.items():
+        out.setdefault(upper, loc)
+    out.update(world_assets)
+
+    if log is not None:
+        log(summarize_maximo_files(out))
 
     return out

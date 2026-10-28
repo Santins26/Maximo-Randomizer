@@ -2,13 +2,11 @@
 research (see ../CROSSWORLD_TEXTURE_RESEARCH.md).
 
 Covers standard MIPS I/II opcodes (arithmetic, loads/stores, branches, jumps).
-Does NOT decode EE-specific "MMI" (multimedia instruction) opcodes -- these
-show up constantly in the compiled code (mostly used by the Metrowerks
-compiler for 128-bit register saves/moves via SQ/LQ-adjacent tricks) and are
-printed as opaque ".mmi 0xXXXXXXXX" placeholders. This was sufficient to
-trace the control flow and integer logic that mattered for this research,
-but a real MMI decoder would remove a lot of the remaining guesswork if this
-work continues.
+Decodes `lq`/`sq` plus the one EE "MMI" (multimedia instruction) form the
+Metrowerks codegen uses pervasively: `paddub rd, rs, $zero`, which is its
+register move, rendered as `move rd, rs`. Every other MMI word is still
+printed as an opaque ".mmi 0xXXXXXXXX" placeholder -- full MMI coverage is
+out of scope.
 
 Usage:
     from mips_disasm import disasm_range
@@ -47,7 +45,13 @@ OPCODES = {
     0x28:'sb', 0x29:'sh', 0x2b:'sw',
     0x2f:'cache', 0x37:'ld', 0x3f:'sd',
     0x31:'lwc1', 0x39:'swc1',
+    0x1e:'lq', 0x1f:'sq',
 }
+
+# Narrow MMI (SPECIAL2, op 0x1c) coverage. Full MMI decoding is out of scope;
+# only the sub-ops the Metrowerks codegen actually leans on are decoded.
+# SPECIAL2 funct 0x28 selects the MMI1 class, whose sub-op field is bits 10..6.
+MMI1_SUBOP_PADDUB = 0x18
 
 def sext16(v):
     return v-0x10000 if v & 0x8000 else v
@@ -87,7 +91,16 @@ def disasm_one(word, addr):
         if name in ('dsll32','dsrl32','dsra32'):
             return f'{name} {r(rd)}, {r(rt)}, {shamt}'
         return f'{name} (unhandled fmt)'
-    if op == 0x1c:  # SPECIAL2 (mmi on EE) - not decoded, see module docstring
+    if op == 0x1c:  # SPECIAL2 (mmi on EE) - narrow subset only
+        # MMI1 class (funct 0x28), sub-op in the shamt field.
+        if funct == 0x28 and shamt == MMI1_SUBOP_PADDUB:
+            # paddub rd, rs, rt. Metrowerks emits it with one source tied to
+            # $zero as its 128-bit-safe register move, so render that as `move`.
+            if rt == 0:
+                return f'move {r(rd)}, {r(rs)}'
+            if rs == 0:
+                return f'move {r(rd)}, {r(rt)}'
+            return f'paddub {r(rd)}, {r(rs)}, {r(rt)}'
         return f'.mmi 0x{word:08x}'
     if op == 0x01:
         name = REGIMM.get(rt, f'regimm_0x{rt:02x}')
@@ -111,9 +124,9 @@ def disasm_one(word, addr):
         return f'{name} {r(rt)}, {r(rs)}, 0x{imm:04x}'
     if name == 'lui':
         return f'lui {r(rt)}, 0x{imm:04x}'
-    if name in ('lb','lh','lw','lbu','lhu','lwu','ld','lwc1'):
+    if name in ('lb','lh','lw','lbu','lhu','lwu','ld','lwc1','lq'):
         return f'{name} {r(rt)}, {sext16(imm)}({r(rs)})'
-    if name in ('sb','sh','sw','sd','swc1'):
+    if name in ('sb','sh','sw','sd','swc1','sq'):
         return f'{name} {r(rt)}, {sext16(imm)}({r(rs)})'
     if name == 'cache':
         return f'cache 0x{rt:x}, {sext16(imm)}({r(rs)})'

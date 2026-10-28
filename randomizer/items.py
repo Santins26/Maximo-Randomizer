@@ -6,8 +6,11 @@ from the universal pool. Enemies are a one-way destination — they can be
 rolled INTO from items, but enemy-to-enemy swaps are handled by the dedicated
 walking-melee randomizer in cli.py.
 
-Size constraints are budget-tracked so the file never grows past its original
-size. Trigger-volume properties are translated when entities move so detection
+PSX files may grow: a replacement record can be larger than the record it
+replaces and the writer emits the longer file. Configured weights are
+therefore literal — each slot simply takes the type it rolled, with no byte
+budget, quota or same-size fallback in the way.
+Trigger-volume properties are translated when entities move so detection
 ranges work at the new world position. Skeleton keys placed at random
 positions get their 'collectable' flags forced on.
 
@@ -246,17 +249,37 @@ GATE_ISOLATED_STAY_RATE = 0.5
 # Default weights for the universal pool — used ONLY when an item DOES change.
 # Tuning rule:
 #   - Coin highest (filler, common floor item)
-#   - Wooden_Chest a bit higher than the rest (chests for mimic/wizard surprises)
-#   - All others evened out at 5
-#   - Health (Extra_Life) and Skeleton_Key are rare (lowest %)
+#   - Wooden_Chest second, clearly behind coins (mimic/wizard surprises)
+#   - Locked_Chest / Skeleton_Key sized together so keys match the locks
+#   - Bag_Of_Gold and Gem are uncommon-but-real gold rewards
+#   - Most structures/smashables sit around 5-8
+#   - Extra_Life is the rarest entry
+# Telemetry from the most recent randomize_universal() item pass: the number
+# of slots that rolled a new type and the histogram of what was actually
+# placed. Populated at the end of every call and cleared at the start, so a
+# caller always reads THIS map's numbers.
+LAST_UNIVERSAL_STATS: dict = {}
+
 DEFAULT_ITEM_WEIGHTS = {
-    # Top tier — chest weights doubled so more chests appear in the final
-    # state, each with freshly-randomized contents and gold.
-    0x21: 326,  # GoldCoin            (bumped from 320 — took share from Bag_Of_Gold)
-    0x25: 360,  # Wooden_Chest        (~36% — bumped from 240 for content variety)
+    # Top tier — coins are the most common drop; chests stay frequent but no
+    # longer outnumber coins, each with freshly-randomized contents and gold.
+    # CURRENCY REBALANCE (user request: "nerf a little bit the wooden chest,
+    # locked chest, skeleton and gold key % and give it to the koins, bag of
+    # gold and gem"). A MODEST shift of 43 weight, pool total unchanged:
+    #   Wooden_Chest 200->170, Locked_Chest 60->52, Skeleton_Key 32->27
+    #   GoldCoin     446->471, Bag_Of_Gold  52->62, Gem          34->42
+    # Gold_Key 0x2B is NOT here and is deliberately NOT added: it is a
+    # PROGRESSION_ANCHOR_TYPES member placed by a post-roll lottery
+    # (GOLD_KEY_SPAWN_PROBABILITY), outside the spawnable pool entirely.
+    # The Skeleton_Key trim is safe because 0x65 is never a randomization
+    # SOURCE (see aggressive_item_randomize), so every vanilla key instance
+    # stays exactly where it is; this weight only governs how many EXTRA keys
+    # other slots roll into.
+    0x21: 471,  # GoldCoin            (most common filler drop — +25 from 446)
+    0x25: 170,  # Wooden_Chest        (nerfed from 200)
     # Mid tier
-    0x46: 6,    # Bag_Of_Gold         (reduced from 12 — share moved to GoldCoin)
-    0x5B: 80,   # Locked_Chest        (8.0% — bumped from 40)
+    0x46: 62,   # Bag_Of_Gold         (a real gold reward — +10 from 52)
+    0x5B: 52,   # Locked_Chest        (nerfed from 60, alongside the key supply)
     # Enemy tier — all enemies normalized to weight 15 so they have EQUAL
     # chances of being rolled. The walking-melee enemy randomizer (in cli.py)
     # already picks uniformly within each world's pool. This block governs
@@ -285,7 +308,7 @@ DEFAULT_ITEM_WEIGHTS = {
     0x16: 15,   # Axe_Guard         (CASTLE)
     # (Flame_Jet 0x40 / Firing_Cannon 0xCC removed from pool — never randomized)
     # Low (0.5% each except Bonus_Grave)
-    0x52: 2,    # Gem                 (0.2% — reduced from 0.5%)
+    0x52: 42,   # Gem                 (uncommon but worth finding — +8 from 34)
     0x0A: 5,    # Popup_Headstone     (0.5%)
     0x24: 25,   # Collector           (2.5% — bumped, was effectively invisible)
     0x20: 28,   # Ability             (2.8% — bumped further, abilities/skills are fun)
@@ -315,7 +338,8 @@ DEFAULT_ITEM_WEIGHTS = {
     0x50: 8,    # Standing_Coffin     (0.8% — CASTLE smashable coffin variant)
     # (Swinging_Spike 0xD1 removed from pool — never randomized)
     # Pickups (0.3-0.5%)
-    0x65: 50,   # Skeleton_Key        (5.0% — bumped, Iron Keys are gating)
+    0x65: 27,   # Skeleton_Key        (nerfed from 32 — EXTRA keys only; the
+                #                      vanilla key instances are never sourced)
     0x45: 5,    # Armor_Power_Up      (0.5% — permanent armor upgrade)
     0x51: 5,    # Full_Health         (0.5% — full HP restore)
     0x4E: 1,    # Extra_Life          (0.1%)
@@ -327,14 +351,16 @@ DEFAULT_ITEM_WEIGHTS = {
 # Gold_Key (0x2B) post-roll lottery probability.
 # After every item finishes rolling its new type via the universal pool, this
 # fraction of rolls "wins" a Gold_Key upgrade — overriding whatever was
-# rolled. Set per user request to 0.01 (= 1%) for every world.
+# rolled. Set to 0.007 (= 0.7%) for every world.
 #
-# The override happens only if:
-#   - a Gold_Key template is available (file or extra_templates supplies one)
-#   - the size delta from the rolled type to Gold_Key fits the byte budget
-# Otherwise the original roll is kept, so the lottery degrades gracefully on
-# tight-budget files.
-GOLD_KEY_SPAWN_PROBABILITY = 0.01
+# This is a POST-ROLL LOTTERY, not a pool weight: it is applied after the
+# weighted pool has already chosen a type, so changing it neither consumes nor
+# frees weight in DEFAULT_ITEM_WEIGHTS and must never be compensated for there.
+#
+# The override happens whenever a Gold_Key template is available (the file or
+# extra_templates supplies one). There is no size condition: the lottery always
+# fires at this probability.
+GOLD_KEY_SPAWN_PROBABILITY = 0.007
 
 # Skeleton_Key (0x65) post-roll lottery probability — used ONLY in the
 # "all enemies" mode (see randomize_universal's `all_enemies` flag). In that
@@ -353,7 +379,7 @@ SKELETON_KEY_SPAWN_PROBABILITY = 0.01
 # higher key supply there than the global default.
 PER_WORLD_ITEM_WEIGHTS: dict[str, dict[int, int]] = {
     'castle': {
-        0x65: 120,  # Skeleton_Key — boosted (~2.4x the global 50) for Castle
+        0x65: 80,  # Skeleton_Key — boosted (~3x the global 27) for Castle
     },
 }
 
@@ -378,7 +404,14 @@ ITEM_STAY_RATE = 0.0
 # The randomizer scales enemy weights at runtime so the enemy slot equals this
 # fraction of the eligible pool — independent of world / pool size.
 # Set to None to use raw weights without normalization.
-ENEMY_SHARE_TARGET = 0.20  # 20% of all item rolls become enemies
+#
+# DEFAULT IS NOW None: THE WEIGHTS THE USER TYPES ARE USED AS TYPED. This used to
+# be 0.20, which forced enemies to exactly 20% of every pool no matter what the
+# spawn-rate editor said -- MEASURED on a real saved config, grave's typed 33.9%
+# enemy share and castle's 48.8% both came out at exactly 20.0%, so changing a
+# percentage had no visible effect. `apply_harder_mode` still sets 0.65 below, so
+# Harder Mode keeps its forced enemy share; only the silent default is gone.
+ENEMY_SHARE_TARGET = None
 
 # Backwards-compat alias
 COIN_TRANSFORM_POOL = UNIVERSAL_ITEM_POOL
@@ -616,7 +649,9 @@ CONTENT_TAG_OPTIONS = [
     ((17, 1), (18, 1)),                  # prize + 1up
     ((19, 1),),                          # surprise
     ((23, 1),),                          # generic content
-    ((14, 1),),                          # generic content B
+    # ((14,1),) removed: verified against the vanilla discs that wooden-chest
+    # records carry property indices 3-6 and 15-34 only — there is no idx=14
+    # slot to write, so this option always produced a contentless chest.
     ((15, 1),),                          # boss/wizard variant
     ((25, 1),),                          # hidden surprise
     ((28, 1),),                          # special drop A
@@ -692,7 +727,6 @@ CONTENT_TAG_WEIGHTS = [
      5,  # (17,1)+(18,1) prize + 1up
      5,  # (19,1)        surprise
      4,  # (23,1)        generic
-     4,  # (14,1)        generic B
      3,  # (15,1)        boss variant
      3,  # (25,1)        hidden surprise
      3,  # (28,1)        special A
@@ -764,6 +798,13 @@ def content_options_without_specials():
 #   idx=7=N   → gold count (NOT a content tag)
 LOCKED_CHEST_CONTENT_INDICES = {3, 4, 8, 9, 10, 12, 14, 15, 16, 17, 19, 21, 22}
 LOCKED_CHEST_GOLD_INDEX = 7  # gold count slot for locked chests
+# Probability a locked chest carries a gold payout at all. Locked chests have
+# no gold entry in LOCKED_CONTENT_TAG_OPTIONS (idx=7 is a plain count, not a
+# content tag), so without this the gold pass would give every locked chest
+# koins — the same flattening that made wooden chests feel gold-only. Roughly
+# matches the ~22% gold share of the wooden content pool, nudged up because
+# locked chests are meant to feel higher-value.
+LOCKED_CHEST_GOLD_CHANCE = 0.3
 LOCKED_CHEST_TYPE_MARKER = (6, 1)  # preserved if vanilla had it; never re-rolled
 
 # Drop options for locked chests — each option is a tuple of (idx, val) tags.
@@ -888,39 +929,50 @@ LOCKED_CONTENT_TAG_WEIGHTS = [
 # describes can spawn. If any specific ID turns out to be a no-op or
 # glitched in-game, remove it from GAME_ABILITY_POOL_EXPERIMENTAL.
 GAME_ABILITY_POOL_VERIFIED = [
-    4,   # Projectiles (axe throw)
-    5,   # Mask of Sorrow
-    10,  # Shield variant
-    12,  # Shield
-    13,  # Shield Charge
-    15,  # Fire Sword (Flame Tongue)
-    16,  # Ice Sword (Frostbiter)
-    17,  # Sun Sword (Orange Sword)
-    18,  # Armageddon
-    20,  # Magic Shield
-    22,  # Health (heart container)
+    4,   # Magic Bolt
+    5,   # Masquerade (Mask of Sorrow)
+    10,  # Smart Bomb
+    12,  # Shield (equip / upgrade)
+    13,  # Shield Stamina (+5)
+    15,  # Fire Sword
+    16,  # Ice Sword
+    17,  # Sun Sword
+    18,  # Armageddon Sword
+    20,  # Magnetic Shield
+    22,  # Full Health
 ]
 
 # Gap IDs not used by any vanilla map — mapped (by elimination against the
 # strategy guide's power-up list) to the remaining sword/shield power-ups.
 GAME_ABILITY_POOL_EXPERIMENTAL = [
-    0,   # (guide power-up — unverified)  e.g. Magic Bolt
-    1,   # (guide power-up — unverified)  e.g. Long Sword
-    2,   # (guide power-up — unverified)  e.g. Gold Seeker
-    3,   # (guide power-up — unverified)  e.g. Doomstrike
-    6,   # (guide power-up — unverified)  e.g. Wider Shockwave
-    7,   # (guide power-up — unverified)  e.g. Ring of Pain
-    8,   # (guide power-up — unverified)  e.g. Shield of Midas
-    9,   # (guide power-up — unverified)  e.g. Shield of Thunder
-    11,  # (guide power-up — unverified)  e.g. Shield of Storms
-    14,  # (guide power-up — unverified)  e.g. Throw Shield
-    19,  # (guide power-up — unverified)  e.g. Hovering Shield / Mighty Throw
-    21,  # (guide power-up — unverified)  e.g. Increased Armor
+    0,   # Increase Sword Power
+    1,   # Sword 720 Spin
+    2,   # Double Slash
+    3,   # Mighty Blow
+    6,   # Return Shield
+    7,   # Wide Shockwave
+    8,   # Damage Shockwave
+    9,   # Find Treasure
+    11,  # Hover Shield
+    14,  # Increase Armor
+    19,  # Wind Shield
+    21,  # Lightning Shield
 ]
 
 # Full pool the randomizer rolls from. Experimental IDs included per user
 # request so every power-up in the strategy guide can appear in-game.
 GAME_ABILITY_POOL = GAME_ABILITY_POOL_VERIFIED + GAME_ABILITY_POOL_EXPERIMENTAL
+
+# Ids that are legal to BAKE INTO A PLACED PICKUP when the user explicitly
+# selects them in the Abilities & Skills editor. This is deliberately wider
+# than GAME_ABILITY_POOL (which drives default random rolls):
+#   23  Increase Throw     - real, measured ability
+#   24  Sword Stamina (+5) - real, measured ability
+# Vanilla maps never place 23/24, but the engine handles them fine, so the
+# editor must be able to place them. Still ineligible on purpose:
+#   25, 26      - no-ops (collecting them does nothing)
+#   27..30      - the kisses (cutscene/story pickups, not abilities)
+PLACEABLE_ABILITY_IDS = set(GAME_ABILITY_POOL) | {23, 24}
 
 # Per-world ability pool.
 #
@@ -1212,7 +1264,7 @@ def apply_harder_mode() -> dict:
     DEFAULT_ITEM_WEIGHTS[0x21] = DEFAULT_ITEM_WEIGHTS.get(0x21, 0) + moved
 
     # 2. Decrease the chance of Keys, Collectors and Skills/Abilities.
-    DEFAULT_ITEM_WEIGHTS[0x65] = 8    # Skeleton_Key (Iron Key) — from 50
+    DEFAULT_ITEM_WEIGHTS[0x65] = 8    # Skeleton_Key (Iron Key) — from 40
     DEFAULT_ITEM_WEIGHTS[0x24] = 4    # Collector       — from 25
     DEFAULT_ITEM_WEIGHTS[0x20] = 4    # Ability/skill   — from 28
     # Castle's boosted key supply is dialled down too (kept above the global
@@ -1622,6 +1674,12 @@ LEVEL_COLUMN_LOCKED_VALUE = 0xFFFFFFFF  # don't touch columns with this value
 
 MONSTER_GENERATOR_TYPE = 0x5F
 
+# Chance that an ENEMY slot becomes a Monster_Generator instead of another
+# enemy during the dedicated enemy randomizer pass. Deliberately small:
+# generators spawn WAVES of enemies, so even a handful of extra portals per
+# level changes the difficulty a lot more than a plain enemy swap does.
+ENEMY_TO_GENERATOR_PROBABILITY = 0.02
+
 
 def get_chest_content_tags(record: PsxRecord) -> tuple:
     """Read the chest's content tags. Uses the index set appropriate for the
@@ -1953,6 +2011,191 @@ def randomize_player_spawn(psx: PsxFile, rng: random.Random) -> dict[int, bytes]
     pick = rng.choice(candidates)
     payload = struct.pack("<fff", pick.pos_x, pick.pos_y, pick.pos_z)
     return {off: payload}
+
+
+# ============================================================================
+# Level-exit (End_Of_Sublevel_Column) location randomization
+# ============================================================================
+# The level exit is entity type 0x4D. It stays in HAZARD_PROTECTED_AS_SOURCE —
+# it is never type-swapped, deleted or replaced. This randomizer only MOVES it:
+# the column and a designer-placed item/structure TRADE positions, so both end
+# up in known-reachable spots and neither overlaps the other.
+EXIT_COLUMN_TYPE = 0x4D
+
+# Eligible trade partners: designer-placed items / structures / smashables.
+# Enemies are excluded (they patrol and can be randomized into other types by
+# the enemy pass) as are scripted props and hazards which must stay exactly
+# where the level designer put them.
+EXIT_SWAP_PARTNER_TYPES = (
+    set(UNIVERSAL_ITEM_POOL) - set(ENEMY_DESTINATIONS) - HAZARD_PROTECTED_AS_SOURCE
+)
+
+
+def move_record_to(rec: PsxRecord, px: float, py: float, pz: float) -> PsxRecord:
+    """Return a copy of `rec` placed at (px,py,pz). Type, name, ids, property
+    entries and record SIZE are all untouched — only the position triple in
+    the entity header changes."""
+    raw = bytearray(rec.raw)
+    struct.pack_into("<3f", raw, RECORD_HEADER_SIZE + 0x10, px, py, pz)
+    return PsxRecord(
+        offset=rec.offset, class_name=rec.class_name,
+        instance_name=rec.instance_name, type_id=rec.type_id,
+        instance_id=rec.instance_id, prop_count=rec.prop_count,
+        pos_x=px, pos_y=py, pos_z=pz,
+        raw=bytes(raw),
+    )
+
+
+def randomize_exit_location(psx: PsxFile, rng: random.Random) -> dict[int, PsxRecord]:
+    """Relocate every End_Of_Sublevel_Column (0x4D) in `psx` by SWAPPING its
+    position with a random designer-placed item/structure in the same map.
+
+    Returns a {record_offset: PsxRecord} replacement dict (empty when the map
+    has no exit column or no eligible partner). Records keep their type and
+    size, so the file layout is unchanged.
+    """
+    exits = [r for r in psx.records if r.type_id == EXIT_COLUMN_TYPE]
+    if not exits:
+        return {}
+
+    prot = get_progression_protected_names(psx)
+    used: set[int] = {r.offset for r in exits}
+    out: dict[int, PsxRecord] = {}
+
+    for ex in exits:
+        partners = [
+            r for r in psx.records
+            if r.type_id in EXIT_SWAP_PARTNER_TYPES
+            and r.offset not in used
+            and (r.instance_name or "") not in prot
+            and (r.pos_x, r.pos_y, r.pos_z) != (ex.pos_x, ex.pos_y, ex.pos_z)
+        ]
+        if not partners:
+            continue
+        pick = rng.choice(partners)
+        used.add(pick.offset)
+        out[ex.offset] = move_record_to(ex, pick.pos_x, pick.pos_y, pick.pos_z)
+        out[pick.offset] = move_record_to(pick, ex.pos_x, ex.pos_y, ex.pos_z)
+    return out
+
+
+def swap_spawn_with_exit(psx: PsxFile) -> tuple[dict[int, bytes], dict[int, PsxRecord]]:
+    """Two-way swap between Maximo's level-start position and the level-exit
+    column (0x4D): the spawn header is set to the column's position and the
+    column is moved to the old spawn position.
+
+    Deterministic, so no rng is needed. Returns
+    (header_patch {offset: packed_xyz}, record_replacements {offset: PsxRecord}).
+    Returns ({}, {}) when the map has no exit column, when the spawn offset is
+    out of range, or when both positions already match. Only the FIRST 0x4D
+    record participates — any additional columns are left untouched.
+    """
+    off = psx.player_spawn_offset
+    if off < 0 or off + 12 > len(psx.raw):
+        return {}, {}
+    cur = psx.get_player_spawn()
+    if cur is None:
+        return {}, {}
+    ex = next((r for r in psx.records if r.type_id == EXIT_COLUMN_TYPE), None)
+    if ex is None:
+        return {}, {}
+    sx, sy, sz = cur[0], cur[1], cur[2]
+    if (ex.pos_x, ex.pos_y, ex.pos_z) == (sx, sy, sz):
+        return {}, {}
+    header_patch = {off: struct.pack("<fff", ex.pos_x, ex.pos_y, ex.pos_z)}
+    return header_patch, {ex.offset: move_record_to(ex, sx, sy, sz)}
+
+
+# Harmless destination preference per record size for gate removal. A plain
+# decoration / pickup is preferred so the slot becomes visually quiet scenery
+# instead of another interactive prop. Anything else in the size's
+# SAME_SIZE_GROUPS entry is used as a fallback.
+GATE_REMOVAL_PREFERRED = {
+    0x228: (0x02,),  # Bonus_Grave  — all gates except Lift_Gate are 0x228
+    0x248: (0x21,),  # GoldCoin     — Lift_Gate (0x41) is 0x248
+}
+# Last-resort same-size decorations, used ONLY when a template exists in the
+# SAME FILE. SWAMP is the case that needs this: no swamp map contains ANY
+# SAME_SIZE_GROUPS[0x228] member, so without this tier every swamp gate would
+# be skipped and swamp levels would stay blocked. These types sit in
+# HAZARD_PROTECTED_AS_SOURCE because they form ORDERED puzzle chains (they are
+# unsafe to MOVE), but as a retype DESTINATION they are plain scenery. Only
+# same-file templates are allowed here so the mesh is guaranteed to be in that
+# world's BEF.
+GATE_REMOVAL_LAST_RESORT = {
+    # Breakable_TikkiTorch / Spirit_Statue / Coffin_Lid (SWAMP),
+    # Underworld_Lantern (UNDER — the only 0x228 prop under-world maps carry).
+    0x228: (0xD3, 0xC8, 0xB5, 0xAE),
+}
+
+
+def remove_all_gates(
+    psx: PsxFile,
+    templates: dict[int, PsxRecord] | None = None,
+) -> dict[int, PsxRecord]:
+    """Retype every gate record in `psx` into a harmless same-size prop.
+
+    Used by the spawn<->exit swap: starting Maximo at the level exit puts him
+    on the far side of the locked gates, so backtracking is blocked and the
+    level cannot be finished unless every gate is gone.
+
+    Records can never be DELETED (the records section has a fixed layout and
+    the count field / post-records pointer describe it), so each gate is
+    RETYPED in place via `make_record_with_template`. The destination comes
+    from SAME_SIZE_GROUPS for the gate's own size, preferring a plain
+    decoration/pickup, and is only used when a template for it exists in this
+    file or in the caller-supplied cross-file `templates` dict. A gate with no
+    usable template is left untouched (the caller reports it as skipped). The
+    destination is never larger than the gate, so the records section can
+    only shrink.
+
+    RISK — scripted gates: Mausoleum_Gate (0x72), Swamp_Locked_Gate (0xC0),
+    Swamp_Crypt_Gate (0xDB) and Graveintro_Locked_Swinging_Gate (0xE2) are in
+    HAZARD_PROTECTED_AS_SOURCE because level scripts reference their
+    instance_names. Retyping them removes the script's target, so instead of
+    an open path the level can hang in infinite loading. They are removed here
+    ANYWAY, by design of this option — it is the same class of trade-off the
+    option's own "can soft lock the game" warning describes.
+
+    Returns a {record_offset: PsxRecord} replacement dict; {} when the map has
+    no gates.
+    """
+    templates = templates or {}
+    targets = [r for r in psx.records if r.type_id in GATE_TYPES]
+    if not targets:
+        return {}
+
+    tpl_cache: dict[int, PsxRecord | None] = {}
+
+    def template_for(tid: int) -> PsxRecord | None:
+        if tid not in tpl_cache:
+            recs = psx.find_records_by_type(tid)
+            tpl_cache[tid] = recs[0] if recs else templates.get(tid)
+        return tpl_cache[tid]
+
+    def local_template_for(tid: int) -> PsxRecord | None:
+        recs = psx.find_records_by_type(tid)
+        return recs[0] if recs else None
+
+    repl: dict[int, PsxRecord] = {}
+    for r in targets:
+        order: list[tuple[int, bool]] = []  # (type_id, same_file_only)
+        for tid in (GATE_REMOVAL_PREFERRED.get(r.size, ())
+                    + SAME_SIZE_GROUPS.get(r.size, ())):
+            if tid in GATE_TYPES or any(t == tid for t, _ in order):
+                continue
+            order.append((tid, False))
+        for tid in GATE_REMOVAL_LAST_RESORT.get(r.size, ()):
+            if tid in GATE_TYPES or any(t == tid for t, _ in order):
+                continue
+            order.append((tid, True))
+        for tid, same_file_only in order:
+            tpl = local_template_for(tid) if same_file_only else template_for(tid)
+            if tpl is None or tpl.size > r.size:
+                continue  # never grow a record
+            repl[r.offset] = make_record_with_template(tpl, r, r.offset)
+            break
+    return repl
 
 
 def place_start_gold_key(
@@ -2393,7 +2636,6 @@ def _randomize_all_enemies(
     rng: random.Random,
     templates: dict[int, PsxRecord],
     enemy_pool: list[int],
-    initial_budget: int,
     gold_key_names: set[str] | None = None,
     type_weights: dict[int, float] | None = None,
 ) -> dict[int, PsxRecord]:
@@ -2405,18 +2647,13 @@ def _randomize_all_enemies(
     the DESTINATION is always an enemy from `enemy_pool` — except for a small
     Skeleton_Key / Gold_Key carve-out so the world stays beatable.
 
-    Conversion strategy (maximize enemy coverage under the fixed byte
-    budget — the PSX records section can NOT grow past its original size):
-      PASS 1: assign EVERY eligible slot the SMALLEST enemy template. This
-              is the cheapest possible growth, so the maximum number of
-              slots convert. Slots that can't even afford the smallest
-              enemy (rare) stay as-is.
-      PASS 2: with whatever budget remains, UPGRADE a weighted-random subset
-              of slots from the smallest enemy to a larger/varied enemy, so
-              the world isn't monotonous. type_weights biases the variety
-              (Raven/Ghost/Torso are down-weighted so they stay rare).
+    Conversion strategy: a single weighted pass. Every eligible slot either
+    wins the Skeleton_Key / Gold_Key carve-out lottery or rolls an enemy
+    straight out of `enemy_pool` against `type_weights`. Records may grow, so
+    no slot is left unconverted and the enemy mix follows the weights
+    literally.
 
-    type_weights: per-type weight for variety selection (default 1.0).
+    type_weights: per-type weight for enemy selection (default 1.0).
     """
     if gold_key_names is None:
         gold_key_names = get_gold_key_protected_names(psx)
@@ -2448,74 +2685,27 @@ def _randomize_all_enemies(
     sk_tmpl = templates.get(0x65)
     gk_tmpl = templates.get(GOLD_KEY_TYPE)
 
-    # Reserve a tiny safety margin so the rewritten file never overshoots.
-    SAFETY = 256
-    budget = initial_budget - SAFETY
+    # ----- Single weighted pass -------------------------------------------
+    # Each eligible slot: carve-out lottery first (Skeleton_Key, then
+    # Gold_Key), otherwise roll the enemy pool against type_weights. Records
+    # are free to grow, so every eligible slot converts.
+    by_offset = {r.offset: r for r in candidates}
+    weighted_pool = [t for t in enemy_pool]
+    weighted_w = [type_weights.get(t, 1.0) for t in weighted_pool]
 
-    pool_sizes = {t: templates[t].size for t in enemy_pool}
-    smallest_enemy = min(pool_sizes, key=pool_sizes.get)
-    smallest_size = pool_sizes[smallest_enemy]
-
-    # ----- PASS 1: convert as MANY slots as possible (cheapest enemy) ------
-    # Process small slots first so the cheap growths land before budget runs
-    # out, maximizing the number of converted slots.
-    candidates.sort(key=lambda r: r.size)
     assigned: dict[int, int] = {}      # offset -> enemy type id
     carve_keys: dict[int, int] = {}    # offset -> 0x65 / Gold_Key
 
     for r in candidates:
-        # Carve-out lottery: Skeleton_Key then Gold_Key (keep game beatable).
         roll = rng.random()
         if sk_tmpl is not None and roll < SKELETON_KEY_SPAWN_PROBABILITY:
-            delta = templates[0x65].size - r.size
-            if delta <= budget:
-                budget -= delta
-                carve_keys[r.offset] = 0x65
-                continue
-        elif (gk_tmpl is not None
-              and roll < SKELETON_KEY_SPAWN_PROBABILITY + GOLD_KEY_SPAWN_PROBABILITY):
-            delta = templates[GOLD_KEY_TYPE].size - r.size
-            if delta <= budget:
-                budget -= delta
-                carve_keys[r.offset] = GOLD_KEY_TYPE
-                continue
-
-        # Default: smallest enemy (cheapest conversion).
-        delta = smallest_size - r.size
-        if delta > budget:
-            # Can't afford even the smallest enemy — try an enemy that is
-            # SMALLER than this slot (a shrink) if one exists.
-            shrinks = [t for t in enemy_pool if pool_sizes[t] <= r.size]
-            if shrinks:
-                t = min(shrinks, key=pool_sizes.get)
-                budget -= (pool_sizes[t] - r.size)
-                assigned[r.offset] = t
-            # else leave unconverted
+            carve_keys[r.offset] = 0x65
             continue
-        budget -= delta
-        assigned[r.offset] = smallest_enemy
-
-    # ----- PASS 2: spend leftover budget upgrading to varied enemies -------
-    # Walk the assigned slots in random order and upgrade each to a
-    # weighted-random enemy if the extra bytes fit. This adds variety while
-    # respecting Raven/Ghost/Torso down-weighting.
-    by_offset = {r.offset: r for r in candidates}
-    upgrade_order = list(assigned.keys())
-    rng.shuffle(upgrade_order)
-    weighted_pool = [t for t in enemy_pool]
-    weighted_w = [type_weights.get(t, 1.0) for t in weighted_pool]
-
-    for off in upgrade_order:
-        if budget <= 0:
-            break
-        cur_type = assigned[off]
-        cur_size = pool_sizes[cur_type]
-        # Pick a weighted-random target enemy.
-        target = rng.choices(weighted_pool, weights=weighted_w, k=1)[0]
-        extra = pool_sizes[target] - cur_size
-        if extra <= 0 or extra <= budget:
-            budget -= max(0, extra)
-            assigned[off] = target
+        if (gk_tmpl is not None
+                and roll < SKELETON_KEY_SPAWN_PROBABILITY + GOLD_KEY_SPAWN_PROBABILITY):
+            carve_keys[r.offset] = GOLD_KEY_TYPE
+            continue
+        assigned[r.offset] = rng.choices(weighted_pool, weights=weighted_w, k=1)[0]
 
     # ----- Build replacement records --------------------------------------
     replacements: dict[int, PsxRecord] = {}
@@ -2544,7 +2734,6 @@ def randomize_universal(
     seed: int,
     weights: dict[int, int] | None = None,
     stay_rate: float | None = None,
-    initial_budget: int = 0,
     extra_templates: dict[int, PsxRecord] | None = None,
     all_enemies: bool = False,
     enemy_types: tuple[int, ...] | None = None,
@@ -2565,8 +2754,8 @@ def randomize_universal(
       - Otherwise, it rolls a new type from the weighted pool. If the rolled type
         equals the current type (rare with low own-weights), the item also stays.
 
-    Byte-budget tracking ensures the file never grows past its original size:
-    chest→pickup shrinks fund coin→chest growth.
+    The file is allowed to grow, so the configured weights are literal: every
+    slot takes the type it rolled, whatever its size.
 
     all_enemies: when True, EVERY eligible item slot becomes an enemy (from
     `enemy_types`, falling back to ENEMY_DESTINATIONS) instead of rolling the
@@ -2585,6 +2774,11 @@ def randomize_universal(
     out of types known to soft-lock (e.g., Dark_Knight 0x53).
     """
     rng = random.Random(seed)
+    # Drop the previous map's telemetry immediately: the early returns below
+    # (no templates / all-enemies mode) never publish, and a caller reading
+    # LAST_UNIVERSAL_STATS after such a call would otherwise report the
+    # PREVIOUS map's numbers under this map's name.
+    LAST_UNIVERSAL_STATS.clear()
     weights = weights or DEFAULT_ITEM_WEIGHTS
     if stay_rate is None:
         stay_rate = ITEM_STAY_RATE
@@ -2603,25 +2797,16 @@ def randomize_universal(
         # keeping key count / placement fully vanilla.
         excluded_types = set(excluded_types) | {0x65}
 
-    # Effective pool / weights / same-size groups. In gate "pool" mode the gate
-    # types are appended so gates are both a SOURCE (a gate can roll into an
-    # item) and a DESTINATION (an item can roll into a gate). Gates are size
-    # 0x228 / 0x248, so they join those same-size groups for budget fallback.
+    # Effective pool / weights. In gate "pool" mode the gate types are appended
+    # so gates are both a SOURCE (a gate can roll into an item) and a
+    # DESTINATION (an item can roll into a gate).
     pool = UNIVERSAL_ITEM_POOL
-    size_groups = SAME_SIZE_GROUPS
     if gate_types:
         pool = tuple(UNIVERSAL_ITEM_POOL) + tuple(
             t for t in gate_types if t not in UNIVERSAL_ITEM_POOL)
         weights = dict(weights)
         for t, w in (gate_weights or GATE_WEIGHTS).items():
             weights.setdefault(t, w)
-        size_groups = {sz: tuple(members) for sz, members in SAME_SIZE_GROUPS.items()}
-        # Place each gate type in its on-disc size group so same-size fallback
-        # can swap gates with items of the same size.
-        for t in gate_types:
-            sz = 0x248 if t == 0x41 else 0x228  # Lift_Gate is 0x248
-            if t not in size_groups.get(sz, ()):
-                size_groups[sz] = tuple(size_groups.get(sz, ())) + (t,)
 
     # SOURCE pool. Gates are added as SOURCES in BOTH gate modes — a gate can
     # roll into any item / structure / enemy from the normal pool. In isolated
@@ -2674,16 +2859,15 @@ def randomize_universal(
     # to types that actually have a template available. A small carve-out
     # turns ~SKELETON_KEY_SPAWN_PROBABILITY of slots into a Skeleton_Key so
     # locked content remains reachable, and the existing Gold_Key lottery
-    # still fires. Byte-budget tracking is preserved (enemy templates vary
-    # in size, so a slot that can't afford its rolled enemy falls back to a
-    # smaller affordable enemy).
+    # still fires. Enemy selection is a single weighted pass — records may
+    # grow, so every eligible slot converts to the enemy it rolled.
     if all_enemies:
         pool = [t for t in (enemy_types or tuple(ENEMY_DESTINATIONS))
                 if t in templates and t not in excluded_types]
         if not pool:
             return {}
         return _randomize_all_enemies(
-            psx, rng, templates, pool, initial_budget, gold_key_names=None,
+            psx, rng, templates, pool, gold_key_names=None,
             type_weights=all_enemies_weights,
         )
 
@@ -2805,30 +2989,12 @@ def randomize_universal(
     # UNIVERSAL_ITEM_POOL as a destination only, never a source — see the
     # explicit GOLD_KEY_TYPE filter above.)
 
-    # Shuffle so big and small records interleave naturally — when a chest happens
-    # to roll a small type early, that frees budget for a coin to roll a chest later.
-    # Process candidates in size-DESCENDING order. The byte budget grows when
-    # large records (chests, locked chests, abilities) shrink into smaller
-    # types, and shrinks when small records (coins, smashables) grow. If we
-    # processed coins first, the budget would be empty before chests get a
-    # chance to release any, forcing most coin rolls into the same-size
-    # fallback. That fallback used to over-represent Raven (the only enemy
-    # in the 0x248 size class) and Torso_Zombie/Ghost (only enemies of their
-    # size). Sorting big-to-small lets shrinks release budget first so growths
-    # can roll into their actual rolled type instead of falling back.
-    candidates.sort(key=lambda r: -r.size)
-
-    # Effective weight per type (after enemy-share normalization). Used by the
-    # same-size fallback so a fallback respects the same probability profile
-    # as the main roll — e.g. coin (weight 320) is hugely preferred over Raven
-    # (effective ~3.5 after enemy-share scaling) within the 0x248 size group.
-    effective_weights: dict[int, int] = {
-        t: w for t, w in zip(choice_types, choice_weights)
-    }
-
+    # ----- Roll -> accept --------------------------------------------------
+    # Records may grow, so there is no byte budget and no rationing: each slot
+    # rolls the weighted pool once and takes what it rolled. Processing order
+    # is therefore irrelevant to the outcome.
     replacements: dict[int, PsxRecord] = {}
-    fallback_records: list[PsxRecord] = []  # records forced to same-size due to budget
-    budget = initial_budget  # accumulated byte savings; growths consume from here
+    rolled_slots = 0          # candidates that actually rolled a new type
 
     for r in candidates:
         # Stay-rate roll: item keeps its current type with probability stay_rate.
@@ -2861,57 +3027,7 @@ def randomize_universal(
                 and rng.random() < GOLD_KEY_SPAWN_PROBABILITY):
             new_type = 0x2B
 
-        new_size = templates[new_type].size
-        delta = new_size - r.size  # positive = growth
-
-        if delta > budget:
-            # Can't afford this growth; fall back to a same-size type using
-            # the SAME weighted distribution as the main roll.
-            #
-            # Enemies are EXCLUDED from this fallback pool. They already get
-            # their target share via the main weighted roll (limited by
-            # ENEMY_SHARE_TARGET); letting them sneak in via fallback would
-            # double-count and over-represent whichever enemy happens to share
-            # a size class with a popular item (e.g. Raven shares 0x248 with
-            # GoldCoin — without this exclusion, ~10% of every coin fallback
-            # rolls Raven, so coin-heavy maps end up swarming with Ravens).
-            same_size_candidates = [
-                t for t in size_groups.get(r.size, ())
-                if t != r.type_id and t in templates
-                and effective_weights.get(t, 0) > 0
-                and t not in ENEMY_DESTINATIONS
-            ]
-            if not same_size_candidates:
-                fallback_records.append(r)
-                continue  # no same-size alternative; revisit later
-            ss_weights = [effective_weights[t] for t in same_size_candidates]
-            new_type = rng.choices(same_size_candidates, weights=ss_weights, k=1)[0]
-            delta = 0
-            fallback_records.append(r)  # also try to upgrade later if budget appears
-
-        budget -= delta
-        replacements[r.offset] = make_record_with_template(templates[new_type], r, r.offset)
-
-    # Second pass: now that budget may have grown from late shrinks, retry items
-    # that earlier fell back to a same-size choice and let them grow if possible.
-    for r in fallback_records:
-        if budget <= 0:
-            break
-        # What's the current type stored for this offset?
-        cur = replacements.get(r.offset, r)
-        # Only consider growing into something larger than current.
-        grow_options = [t for t in choice_types
-                        if t in templates and templates[t].size > cur.size]
-        if not grow_options:
-            continue
-        # Affordability check
-        affordable = [t for t in grow_options if (templates[t].size - cur.size) <= budget]
-        if not affordable:
-            continue
-        weights_aff = [effective_weights.get(t, 1) for t in affordable]
-        new_type = rng.choices(affordable, weights=weights_aff, k=1)[0]
-        delta = templates[new_type].size - cur.size
-        budget -= delta
+        rolled_slots += 1
         replacements[r.offset] = make_record_with_template(templates[new_type], r, r.offset)
 
     # Post-process: any Skeleton_Key the randomizer created needs its
@@ -2959,13 +3075,26 @@ def randomize_universal(
                     raw=bytes(new_raw),
                 )
 
+    # ----- Publish telemetry ----------------------------------------------
+    # `achieved` is a plain histogram of what was actually placed — with
+    # literal weights it should track the configured shares closely. Reported
+    # per call, so the caller must read it right after randomize_universal
+    # returns.
+    achieved: dict[int, int] = {}
+    for rec in replacements.values():
+        achieved[rec.type_id] = achieved.get(rec.type_id, 0) + 1
+    LAST_UNIVERSAL_STATS.clear()
+    LAST_UNIVERSAL_STATS.update({
+        'rolled_slots': rolled_slots,
+        'achieved': achieved,
+    })
+
     return replacements
 
 
 def aggressive_item_randomize(
     psx: PsxFile,
     seed: int,
-    initial_budget_deficit: int = 0,
     existing_repl: dict[int, PsxRecord] | None = None,
     extra_templates: dict[int, PsxRecord] | None = None,
     world: str | None = None,
@@ -2988,13 +3117,12 @@ def aggressive_item_randomize(
     gate_templates: dict[int, PsxRecord] | None = None,
     preserve_chests: bool = False,
     preserve_iron_keys: bool = False,
+    ability_weights: dict[int, int] | None = None,
 ) -> dict[int, PsxRecord]:
     """All-in-one: every item-class entity rolls into another type from the
     UNIVERSAL pool, then surviving chests/abilities get their content
     further randomized.
 
-    initial_budget_deficit: bytes already consumed by other randomizers
-    (e.g., enemy swap in cli.py) so the universal pool stays under budget.
     existing_repl: replacements already produced upstream (e.g., enemy type
     swaps from cli.py). Step 6 (tier randomization) reads from this so it
     can re-tier the POST-swap type, not the vanilla original.
@@ -3020,6 +3148,15 @@ def aggressive_item_randomize(
       do_columns: HUB blind level-select column shuffle.
     When a category is False, that part of the game is left at its vanilla
     values.
+
+    ability_weights: optional {ability_id: weight} from the GUI's
+    "Abilities & Skills" editor. When given, the baked Ability pickup ids are
+    rolled ONLY from the ids with weight > 0 (so an unchecked ability never
+    spawns), using those weights. Ids outside PLACEABLE_ABILITY_IDS are
+    reported and ignored.
+    If the resulting pool is empty the per-world pool is used instead so we
+    never write an invalid id. Providing this dict also enables the ability
+    pass even when do_skills is False.
     """
     rng_master = random.Random(seed)
     all_repl: dict[int, PsxRecord] = dict(existing_repl) if existing_repl else {}
@@ -3062,7 +3199,6 @@ def aggressive_item_randomize(
         repl = randomize_universal(
             psx, seed=s,
             weights=universal_weights or get_item_weights_for_world(world),
-            initial_budget=-initial_budget_deficit,
             extra_templates=gp_extra,
             all_enemies=all_enemies,
             enemy_types=enemy_types,
@@ -3154,6 +3290,10 @@ def aggressive_item_randomize(
     # it toward "just 1 koin".
     GOLD_AMOUNTS = CHEST_GOLD_AMOUNTS
     GOLD_WEIGHTS = CHEST_GOLD_WEIGHTS
+    # Same curve with the 0-coin entry dropped — used for chests that DID roll
+    # a gold reward, where writing 0 would cancel that reward.
+    GOLD_AMOUNTS_NONZERO = [a for a in GOLD_AMOUNTS if a != 0]
+    GOLD_WEIGHTS_NONZERO = [w for a, w in zip(GOLD_AMOUNTS, GOLD_WEIGHTS) if a != 0]
 
     # Gather final-state chests: source chests that stayed chests, plus new
     # chests created by other items being transformed into chests.
@@ -3172,14 +3312,42 @@ def aggressive_item_randomize(
         if base is None:
             base = next(o for o in psx.records if o.offset == off)
         # Wooden chests use idx=16 for gold; locked chests use idx=7
-        gold_idx = LOCKED_CHEST_GOLD_INDEX if base.type_id == 0x5B else 16
+        #
+        # BUG FIX (chests "almost always give koins/health"): this pass used
+        # to stamp a fresh gold count into EVERY final-state chest. With
+        # CHEST_GOLD_WEIGHTS the 0-coin outcome is only 15/253 (~6%), so ~94%
+        # of chests ended up carrying a gold tag on top of whatever step 2
+        # rolled — an ability/armor/iron-key/prize chest still paid out koins,
+        # and the gold drop visually dominates the other reward. Measured on
+        # G_INTRO+G_SUB1 (seed 1234): 55/55 wooden chests carried (16,N).
+        # So the content pool was already varied; the gold pass was flattening
+        # it back to gold. Gold is now written ONLY when the chest's rolled
+        # content actually asked for gold (wooden: the (16,N) tag is part of
+        # the content roll), and the slot is explicitly zeroed otherwise so a
+        # retyped chest can't inherit its template's gold either.
+        # Locked chests keep gold as a separate roll (idx=7 is not part of
+        # their content pool) but only at LOCKED_CHEST_GOLD_CHANCE, so they
+        # aren't universally gold either.
+        final_tags = get_chest_content_tags(base)
+        if base.type_id == 0x5B:
+            gold_idx = LOCKED_CHEST_GOLD_INDEX
+            wants_gold = grng.random() < LOCKED_CHEST_GOLD_CHANCE
+        else:
+            gold_idx = 16
+            wants_gold = any(i == 16 for i, _ in final_tags)
         for k in range(base.prop_count):
             eo = 0x228 + k * 0x20
             if eo + 0x20 > base.size:
                 break
             idx = struct.unpack_from("<I", base.raw, eo + 4)[0]
             if idx == gold_idx:
-                new_amount = grng.choices(GOLD_AMOUNTS, weights=GOLD_WEIGHTS, k=1)[0]
+                if wants_gold:
+                    # Non-zero amounts only: a 0 here would silently erase the
+                    # gold reward the content roll just chose.
+                    new_amount = grng.choices(GOLD_AMOUNTS_NONZERO,
+                                              weights=GOLD_WEIGHTS_NONZERO, k=1)[0]
+                else:
+                    new_amount = 0
                 new_raw = bytearray(base.raw)
                 struct.pack_into("<I", new_raw, eo + 8, new_amount)
                 all_repl[base.offset] = PsxRecord(
@@ -3218,9 +3386,22 @@ def aggressive_item_randomize(
         pool = GAME_ABILITY_POOL
         pool_weights = [1] * len(pool)
 
+    # Editor selection wins: only ids the user left enabled (weight > 0) can
+    # be baked into a pickup. Empty selection -> keep the per-world pool.
+    if ability_weights:
+        _sel = [i for i in sorted(ability_weights)
+                if ability_weights[i] > 0 and i in PLACEABLE_ABILITY_IDS]
+        for i in sorted(ability_weights):
+            if ability_weights[i] > 0 and i not in PLACEABLE_ABILITY_IDS:
+                print(f"ELF patch: ability id {i} is not placeable "
+                      f"(no-op / kiss id) - skipped")
+        if _sel:
+            pool = _sel
+            pool_weights = [ability_weights[i] for i in _sel]
+
     # Collect every offset whose final type is 0x20 (Ability).
     final_ability_offsets: set[int] = set()
-    if do_skills:
+    if do_skills or ability_weights:
         for orig in psx.records:
             cur = all_repl.get(orig.offset, orig)
             if cur.type_id == 0x20:

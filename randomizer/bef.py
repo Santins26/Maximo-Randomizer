@@ -193,9 +193,18 @@ class BefFile:
             
             # Replace existing entries in place
             # This requires rebuilding the entire data section
+            #
+            # The data section MUST start after the NEW TOC. This line used to
+            # use ``self.toc_count`` (the OLD count) while the header/TOC below
+            # were written with ``new_toc_count``, so every offset recorded was
+            # 8 bytes per appended entry (8*N) too small and EVERY pre-existing
+            # entry pointed 8*N bytes before its real blob -- silently
+            # corrupting the whole file (invisible enemies / wrong meshes).
+            # Keep deriving offsets from the actual write position below.
+            new_toc_count = self.toc_count + len(new_entries)
             toc_data = bytearray()
             data_section = bytearray()
-            current_offset = HEADER_SIZE + self.toc_count * TOC_ENTRY_SIZE
+            data_start = HEADER_SIZE + new_toc_count * TOC_ENTRY_SIZE
             
             # Read original TOC and rebuild with replacements
             for i in range(self.toc_count):
@@ -215,18 +224,14 @@ class BefFile:
                         next_offset = len(self.raw)
                     blob = self.raw[old_offset:next_offset]
                 
-                toc_data += struct.pack("<II", type_id, current_offset)
+                # Offset = where this blob actually lands in the new file.
+                toc_data += struct.pack("<II", type_id, data_start + len(data_section))
                 data_section += blob
-                current_offset += len(blob)
             
-            # Update toc_count if we have new entries to append
-            new_toc_count = self.toc_count + len(new_entries)
-            
-            # Append new entries after replacements
+            # Append new entries after replacements, in original TOC order.
             for entry in new_entries:
-                toc_data += struct.pack("<II", entry.type_id, current_offset)
+                toc_data += struct.pack("<II", entry.type_id, data_start + len(data_section))
                 data_section += entry.data
-                current_offset += len(entry.data)
             
             # Build header with updated count
             header = bytearray(HEADER_SIZE)
@@ -277,12 +282,198 @@ class BefFile:
         struct.pack_into("<I", header, 0x14, new_toc_count)
 
         return bytes(header) + bytes(toc_data) + existing_data + new_blobs
+MATERIAL_SECTION_START_OFFSET = 0x20
+MATERIAL_SECTION_END_OFFSET = 0x24
+
+#: rec_type byte -> resource category it introduces. Measured across all 359
+#: blobs of all five worlds: 0x05 always carries a CATEGORY-1 reference and
+#: comes first when both are present; 0x04 always carries CATEGORY-2 and comes
+#: second.
+MATERIAL_REC_TYPES: dict[int, int] = {0x05: 1, 0x04: 2}
+
+#: A resource reference is 1 byte of rec_type plus a u32 LE whose top byte is
+#: a flag (category in bits 24-30, is_global in bit 31) and whose low 24 bits
+#: are the index.
+MATERIAL_REF_SIZE = 5
+MATERIAL_INDEX_MASK = 0x00FFFFFF
+MATERIAL_CATEGORY_MASK = 0x7F
+MATERIAL_GLOBAL_BIT = 0x80
+
+#: CATEGORY-1 = an index into the world's .PRS MESH TABLE.
+MATERIAL_CATEGORY_MESH = 1
+#: CATEGORY-2 = an index into the world's .PRS ANIM TABLE.
+MATERIAL_CATEGORY_ANIM = 2
+
+
+class MaterialSectionError(Exception):
+    """A blob's material section could not be walked with its own framing.
+
+    Framing is ``[record_count u32]`` then per record ``[len u32][body...]``,
+    and a correct walk consumes exactly ``record_count`` records and lands
+    exactly on the section end. Anything else means the bytes are not what we
+    think they are, so callers must refuse rather than guess.
+    """
+
+
+@dataclass(frozen=True)
+class MaterialRef:
+    """One resource reference at the head of a material record's body.
+
+    ``idx_offset`` is the byte offset, WITHIN THE BLOB, of the u32 whose low 24
+    bits are the index and whose top byte is the flag. Rewriting must preserve
+    that flag byte exactly -- it carries both the category and the is_global
+    bit, and forging either repoints the reference at a different resource
+    table.
+    """
+
+    record: int          # record ordinal within the material section
+    slot: int            # 0 = first ref of the record, 1 = second
+    rec_type: int        # 0x05 (category 1) or 0x04 (category 2)
+    idx_offset: int      # blob offset of the u32 index/flag field
+    flag: int            # bits 24-31 of that u32
+    index: int           # bits 0-23 of that u32
+
+    @property
+    def category(self) -> int:
+        """Resource category, bits 24-30 of the u32."""
+        return self.flag & MATERIAL_CATEGORY_MASK
+
+    @property
+    def is_global(self) -> bool:
+        """Bit 31: the reference resolves against GLOBAL.PRS, not the world's."""
+        return bool(self.flag & MATERIAL_GLOBAL_BIT)
+
+    def describe(self) -> str:
+        scope = "GLOBAL" if self.is_global else "LOCAL"
+        return (f"rec{self.record}.{self.slot} @0x{self.idx_offset:X} "
+                f"type=0x{self.rec_type:02X} cat={self.category} "
+                f"{scope} index={self.index}")
+
+
+def material_section_bounds(blob: bytes) -> tuple[int, int]:
+    """Return ``(section_start, section_end)`` from blob+0x20 / blob+0x24."""
+    if len(blob) < MATERIAL_SECTION_END_OFFSET + 4:
+        raise MaterialSectionError(
+            f"blob is {len(blob)} bytes, too small to hold material section "
+            f"bounds")
+    start = struct.unpack_from("<I", blob, MATERIAL_SECTION_START_OFFSET)[0]
+    end = struct.unpack_from("<I", blob, MATERIAL_SECTION_END_OFFSET)[0]
+    if not (0 < start < end <= len(blob)):
+        raise MaterialSectionError(
+            f"material section bounds [{start}, {end}) are not inside the "
+            f"{len(blob)}-byte blob")
+    return start, end
+
+
+def parse_material_refs(blob: bytes) -> list[MaterialRef]:
+    """Parse every resource reference in a BEF blob's material section.
+
+    The section at ``[blob+0x20, blob+0x24)`` is framed as::
+
+        [record_count u32]
+        per record: [len u32][body ... len bytes]
+
+    and each record's BODY begins with one or two 5-byte resource references
+    ``[rec_type u8][u32 LE = flag<<24 | index]``. rec_type 0x05 introduces a
+    CATEGORY-1 reference (an index into the world's .PRS MESH TABLE) and comes
+    first when present; rec_type 0x04 introduces CATEGORY-2 (an index into that
+    world's .PRS ANIM TABLE) and comes second.
+
+    Walking with this framing parses all 359 blobs across all five worlds with
+    the record count and the section end both landing exactly, which is why the
+    walk is strict: a mismatch raises ``MaterialSectionError`` instead of
+    returning a partial, guessed list.
+    """
+    start, end = material_section_bounds(blob)
+    if start + 4 > end:
+        raise MaterialSectionError(
+            f"material section [{start}, {end}) has no room for a record count")
+    count = struct.unpack_from("<I", blob, start)[0]
+    refs: list[MaterialRef] = []
+    pos = start + 4
+    for k in range(count):
+        if pos + 4 > end:
+            raise MaterialSectionError(
+                f"record {k} of {count}: length field at {pos} runs past the "
+                f"section end {end}")
+        length = struct.unpack_from("<I", blob, pos)[0]
+        body = pos + 4
+        body_end = body + length
+        if body_end > end:
+            raise MaterialSectionError(
+                f"record {k} of {count}: body [{body}, {body_end}) runs past "
+                f"the section end {end}")
+        p = body
+        slot = 0
+        while (p + MATERIAL_REF_SIZE <= body_end
+               and blob[p] in MATERIAL_REC_TYPES):
+            raw = struct.unpack_from("<I", blob, p + 1)[0]
+            refs.append(MaterialRef(
+                record=k,
+                slot=slot,
+                rec_type=blob[p],
+                idx_offset=p + 1,
+                flag=(raw >> 24) & 0xFF,
+                index=raw & MATERIAL_INDEX_MASK,
+            ))
+            p += MATERIAL_REF_SIZE
+            slot += 1
+        pos = body_end
+    if pos != end:
+        raise MaterialSectionError(
+            f"material walk consumed {count} record(s) and stopped at {pos}, "
+            f"but the section ends at {end} ({end - pos:+d} bytes)")
+    return refs
+
+
+def set_material_ref_index(blob: bytes, ref: MaterialRef,
+                           new_index: int) -> bytes:
+    """Return a copy of ``blob`` with ``ref``'s index rewritten.
+
+    ONLY the 24 index bits change. The top byte -- and therefore both the
+    resource category (bits 24-30) and the is_global bit (31) -- is written back
+    byte-identical, read from the buffer rather than from ``ref``, so a stale
+    ref object can never forge a flag.
+
+    At current table sizes every index fits in one byte, but the field is 24
+    bits wide and the full width is written: the u32 at ``ref.idx_offset``
+    becomes ``(flag << 24) | new_index`` in little-endian, so indices above 255
+    correctly spill into the second and third bytes and never touch the flag.
+    """
+    if not isinstance(new_index, int) or new_index < 0:
+        raise ValueError(f"new_index must be a non-negative int, got {new_index!r}")
+    if new_index > MATERIAL_INDEX_MASK:
+        raise ValueError(
+            f"new_index {new_index} does not fit in the 24-bit index field "
+            f"(max {MATERIAL_INDEX_MASK})")
+    if ref.idx_offset + 4 > len(blob):
+        raise ValueError(
+            f"ref index field at {ref.idx_offset} is outside the "
+            f"{len(blob)}-byte blob")
+    out = bytearray(blob)
+    flag = out[ref.idx_offset + 3]          # LE: top byte is the flag byte
+    struct.pack_into("<I", out, ref.idx_offset, (flag << 24) | new_index)
+    assert out[ref.idx_offset + 3] == flag, "flag byte must survive a rewrite"
+    return bytes(out)
+
+
 def find_texture_indices(blob: bytes) -> list[int]:
-    """Find byte offsets of texture page indices within a BEF blob.
-    
-    Pattern: 00 00 00 [04|05] [TEX_IDX] 00 00 [01|02|03|04]
-    The TEX_IDX byte is a per-world PRT page reference.
-    Indices are in the material section between blob+0x20 and blob+0x24.
+    """DEPRECATED -- use ``parse_material_refs`` instead.
+
+    This looked for the byte pattern ``00 00 00 [04|05] [IDX] 00 00
+    [01|02|03|04]`` in a flat scan of the material section. That pattern
+    demands three zero bytes IMMEDIATELY BEFORE the rec_type byte, which only
+    holds when the reference is preceded by the zero-padded tail of something
+    else. When two references sit adjacent -- the normal case, category 1
+    (rec_type 0x05) followed directly by category 2 (rec_type 0x04) -- the
+    second one's rec_type is preceded by the first one's index/flag bytes, so
+    it never matches. The scan therefore reports at most the FIRST reference of
+    an adjacent pair and misses every category-2 reference, and it has no idea
+    which category, index, or global bit it is looking at.
+
+    Kept only so stale callers keep importing. Do not build anything new on it:
+    ``parse_material_refs`` walks the real ``[count][len][body]`` framing and
+    returns typed refs with category, index and is_global.
     """
     if len(blob) < 0x28:
         return []
@@ -303,21 +494,32 @@ def find_texture_indices(blob: bytes) -> list[int]:
 
 
 def remap_blob_textures(blob: bytes, target_bef: "BefFile") -> bytes:
-    """Return the blob unchanged.
+    """Return the blob unchanged -- and that is NOT good enough for a foreign world.
 
-    Earlier versions of this function set bit 7 on material-section flags
-    (0x01→0x81, 0x02→0x82) to force GLOBAL resource loading for foreign
-    enemy blobs. Byte-exact comparison with GRAVE_CROSSWORLD.BEF — the only
-    confirmed-working cross-world injection — proved this was wrong:
+    THE OLD DOCSTRING'S CLAIM IS DISPROVEN. It said "the engine resolves each
+    enemy type's textures by TYPE_ID lookup against the PRS/PRT resource
+    tables, not by indices embedded in the BEF blob". A blob's material section
+    (``[blob+0x20, blob+0x24)``) demonstrably DOES embed per-world resource
+    indices: each material record's body opens with one or two 5-byte
+    references ``[rec_type u8][u32 = flag<<24 | index]`` where a CATEGORY-1
+    reference is a positional index into THAT WORLD's .PRS mesh table and a
+    CATEGORY-2 reference indexes that world's .PRS anim table (bit 31 marks the
+    handful that resolve against GLOBAL instead). Proof: Dark_Knight 0x53's
+    CASTLE cat-1 refs are 25, 25, 26, and CASTLE.PRS mesh[25] is the tag-6,
+    132,900-byte, 34-bone, 31-render-pass PSkeleton independently identified as
+    his mesh. The same asset sits at a DIFFERENT index in every world.
 
-      Source blob (SWAMP.BEF, type 0x0D):  2624 bytes
-      Working blob (GRAVE_CROSSWORLD.BEF):  4240 bytes (padded, content identical)
-      Byte differences:                     ZERO — the blob is used as-is.
+    Setting bit 7 on the flags (the even older behaviour) was also wrong: it
+    claims the resource lives in GLOBAL, which for an enemy mesh it does not.
 
-    The engine resolves each enemy type's textures by TYPE_ID lookup against
-    the PRS/PRT resource tables, not by indices embedded in the BEF blob.
-    Blobs are identical across every world that contains them; no per-world
-    material patching is required or correct.
+    So this function stays a no-op ON PURPOSE, but it is NOT a substitute for
+    porting. Copying a foreign blob verbatim leaves its indices pointing at
+    whatever occupies those slots in the target world. Correct cross-world
+    placement goes through ``cross_world.WorldPortSession.port_enemy``, which
+    ports the referenced mesh entries into the target .PRS and rewrites each
+    local cat-1 reference with ``set_material_ref_index``.
+    ``inject_cross_world_enemies`` below, which calls this, is the LEGACY
+    verbatim-copy path and is not index-correct.
     """
     return blob
 
@@ -365,6 +567,21 @@ def inject_locked_enemy(
 ) -> tuple[bytes, bytes, Optional[bytes], int]:
     """Port a world-exclusive enemy (mesh + textures) into a foreign world and
     inject its BEF blob with corrected indices.
+
+    *** WARNING: UNFOUNDED PREMISE -- DO NOT CALL. ***
+    This uses the same false field as ``mesh_port``: the u16 at BEF blob offset
+    22, read here as a positional .PRS mesh-table index. It is not one. In a
+    single GRAVE.BEF, seven native enemies all carry 25 there (Zombie_Crocodile
+    0x0D, Axe_Skeleton 0x2F, Raven 0x37, Basic_Skeleton 0x47, Guard_Skeleton
+    0x54, Torso_Zombie 0x6A, Ghost 0x6B); Basic_Skeleton and Guard_Skeleton both
+    render correctly in vanilla and look nothing alike, so 25 cannot be a shared
+    model index. Three more natives share 30. So "extract mesh[N], splice it in,
+    rewrite offset 22" splices an unrelated object and overwrites a field of
+    unknown meaning: the enemy spawns wearing an arbitrary prop. The whole mesh
+    splice path is parked at ``cross_world.MESH_PORT_ENABLED = False``; nothing
+    downstream of offset 22 is trustworthy. The ``global_tex_count = 164``
+    hardcoded fallback below is a separate, independently bad idea (see
+    ``cross_world.read_global_tex_count``).
 
     World-exclusive enemies can't be injected via inject_cross_world_enemies
     alone, because:
